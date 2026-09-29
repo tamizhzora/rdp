@@ -1,0 +1,179 @@
+name: RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: 'Session length in minutes (GitHub hard-caps this at 360)'
+        type: string
+        default: '360'
+      hostname_suffix:
+        description: 'Tailscale hostname suffix (default: the run ID)'
+        type: string
+        default: ''
+      packages:
+        description: 'Comma-separated Chocolatey packages to install (optional, e.g. "vscode,googlechrome")'
+        type: string
+        default: ''
+      tailscale_tag:
+        description: 'Tailscale ACL tag applied to this node (must exist in your tailnet ACL policy - see comments below)'
+        type: string
+        default: 'tag:ci-runner'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2022
+    # GitHub-hosted runners have a hard 360-minute (6-hour) cap that cannot be raised,
+    # only lowered - fromJson() turns the string input into the number this field needs.
+    timeout-minutes: ${{ fromJson(inputs.duration_minutes) }}
+
+    # secrets can't be referenced directly inside a step's "if:" condition (that's what
+    # caused "Unrecognized named-value: 'secrets'"). Pulling them into job-level env
+    # first makes them available as env.X, which if: does support.
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      NTFY_URL: ${{ secrets.NTFY_URL }}
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+
+          # NLA + TLS security layer stay ON. Tailscale already authenticates/encrypts
+          # the transport, but this is a second, essentially free layer of defense.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 2 -Force
+
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          # Only Tailscale peers (CGNAT range) can reach RDP - not the whole internet.
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with a Cryptographically Random Password
+        shell: pwsh
+        run: |
+          $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+          function Get-RandomChars($set, $count) {
+              $bytes = New-Object byte[] $count
+              $rng.GetBytes($bytes)
+              $bytes | ForEach-Object { $set[$_ % $set.Length] }
+          }
+
+          $upper   = [char[]](65..90)
+          $lower   = [char[]](97..122)
+          $number  = [char[]](48..57)
+          $special = [char[]]((33..47) + (58..64) + (91..96) + (123..126))
+
+          $rawPassword  = @()
+          $rawPassword += Get-RandomChars $upper 4
+          $rawPassword += Get-RandomChars $lower 4
+          $rawPassword += Get-RandomChars $number 4
+          $rawPassword += Get-RandomChars $special 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+          # Plain, not masked, on purpose - it needs to be readable in the "Maintain
+          # Connection" log output, which is how you retrieve it. Keep this repo private.
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      - name: Install Requested Packages
+        if: inputs.packages != ''
+        shell: pwsh
+        run: |
+          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
+              Set-ExecutionPolicy Bypass -Scope Process -Force
+              iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          }
+          $pkgs = "${{ inputs.packages }}" -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          foreach ($pkg in $pkgs) {
+              Write-Host "Installing $pkg..."
+              choco install $pkg -y --no-progress
+          }
+
+      - name: Connect to Tailscale
+        # tags: requires "tag:ci-runner" (or whatever you set) to already exist under
+        # "tagOwners" in your tailnet's ACL policy, e.g.:
+        #   "tagOwners": { "tag:ci-runner": ["autogroup:admin"] }
+        # and your TAILSCALE_AUTH_KEY must be allowed to apply that tag. Once tagged,
+        # restrict *who can reach it* with an ACL grant, e.g.:
+        #   "acls": [{ "action": "accept", "src": ["you@example.com"], "dst": ["tag:ci-runner:3389"] }]
+        # That ACL grant - not this workflow - is what actually limits access on the tailnet.
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gh-runner-${{ inputs.hostname_suffix != '' && inputs.hostname_suffix || github.run_id }}
+          tags: ${{ inputs.tailscale_tag }}
+
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = tailscale ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: pwsh
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Send Ready Notification
+        if: ${{ env.DISCORD_WEBHOOK_URL != '' || env.NTFY_URL != '' }}
+        shell: pwsh
+        run: |
+          # Only the IP + username go out over the webhook - never the password.
+          # A webhook endpoint is a wider trust boundary than this repo's own Actions
+          # logs, so the password stays retrievable only from the log below.
+          $msg = "RDP runner ready`nTailscale IP: $env:TAILSCALE_IP`nUser: RDP`n(password is in the workflow run log)"
+
+          if ($env:DISCORD_WEBHOOK_URL) {
+              $body = @{ content = $msg } | ConvertTo-Json
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post -Body $body -ContentType 'application/json'
+          }
+          if ($env:NTFY_URL) {
+              Invoke-RestMethod -Uri $env:NTFY_URL -Method Post -Body $msg
+          }
+
+      - name: Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address:  $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - cancel the workflow run in GitHub to terminate"
+              Start-Sleep -Seconds 300
+          }
